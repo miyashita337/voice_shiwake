@@ -38,37 +38,42 @@ def main() -> None:
 @main.command()
 @click.option("--name", required=True, help="参加者の表示名（例: 田中太郎）")
 @click.option("--audio", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="30秒程度の音声サンプル")
+@click.option("--source", default="", help="サンプル出所（例: 2026-06-01 weekly）")
 @click.option("--note", default="", help="メモ（任意）")
-def enroll(name: str, audio: Path, note: str) -> None:
-    """参加者の声紋を登録する。"""
+@click.option("--replace", is_flag=True, help="既存サンプルを全削除してから登録（既定: 追加モード）")
+def enroll(name: str, audio: Path, source: str, note: str, replace: bool) -> None:
+    """参加者の声紋を登録する（既定は追加モード、同名で複数サンプル蓄積可能）。"""
     db = VoiceprintDB()
     try:
-        vp = db.enroll(name=name, audio_path=audio, note=note)
-        click.echo(f"登録完了: {vp.name} (embedding dim={len(vp.embedding)})")
+        vp = db.enroll(name=name, audio_path=audio, source=source, note=note, replace=replace)
+        # 同名サンプル数を表示
+        sample_count = sum(1 for v in db.list_all() if v.name == name)
+        mode = "上書き" if replace else "追加"
+        click.echo(f"登録完了 ({mode}): {vp.name} sample_id={vp.sample_id} (累計 {sample_count} sample)")
     finally:
         db.close()
 
 
 @main.command(name="list")
 def list_voiceprints() -> None:
-    """登録済み声紋を一覧表示。"""
+    """登録済み声紋を一覧表示（名前ごとのサンプル数）。"""
     db = VoiceprintDB()
     try:
-        all_vps = db.list_all()
-        if not all_vps:
+        stats = db.stats()
+        if not stats:
             click.echo("登録済み声紋なし。`voice-shiwake enroll` で追加してください。")
             return
-        for vp in all_vps:
-            note = f" - {vp.note}" if vp.note else ""
-            click.echo(f"- {vp.name}{note}")
+        for s in stats:
+            srcs = f" [{', '.join(s.sources)}]" if any(s.sources) else ""
+            click.echo(f"- {s.name}: {s.sample_count} samples{srcs}")
     finally:
         db.close()
 
 
 @main.command()
-@click.option("--name", required=True, help="削除する声紋名")
+@click.option("--name", required=True, help="削除する声紋名（全サンプル削除）")
 def delete(name: str) -> None:
-    """登録済み声紋を削除。"""
+    """登録済み声紋を削除（その名前の全サンプル）。"""
     db = VoiceprintDB()
     try:
         deleted = db.delete(name)
@@ -77,6 +82,74 @@ def delete(name: str) -> None:
         else:
             click.echo(f"見つからず: {name}", err=True)
             sys.exit(1)
+    finally:
+        db.close()
+
+
+@main.command()
+@click.option("--samples-dir", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path), help="SPEAKER_*.wav が入ったディレクトリ")
+@click.option("--map", "mappings", multiple=True, required=True, help="ラベル対応（複数指定可）。例: --map A=田中 --map B=佐藤")
+@click.option("--source", default="", help="サンプル出所（既定: ディレクトリ名）")
+def correct(samples_dir: Path, mappings: tuple[str, ...], source: str) -> None:
+    """SPEAKER_X.wav に正解の人物名を紐付けて声紋DBに追加する（継続学習）。
+
+    例:
+        voice-shiwake correct --samples-dir work/samples \\
+            --map A=山田太郎 --map B=小川 --map C=林
+    """
+    source = source or samples_dir.name
+    parsed: list[tuple[str, str]] = []
+    for m in mappings:
+        if "=" not in m:
+            click.echo(f"不正な --map 形式（A=name 必要）: {m}", err=True)
+            sys.exit(1)
+        label, person = m.split("=", 1)
+        label = label.strip().upper()
+        person = person.strip()
+        if not label or not person:
+            click.echo(f"空のラベル/人物名: {m}", err=True)
+            sys.exit(1)
+        parsed.append((label, person))
+
+    db = VoiceprintDB()
+    try:
+        for label, person in parsed:
+            # SPEAKER_A.wav / A.wav どちらでも拾う
+            candidates = [
+                samples_dir / f"SPEAKER_{label}.wav",
+                samples_dir / f"{label}.wav",
+            ]
+            audio = next((c for c in candidates if c.exists()), None)
+            if audio is None:
+                click.echo(f"  [SKIP] SPEAKER_{label}.wav が見つからず", err=True)
+                continue
+            vp = db.enroll(name=person, audio_path=audio, source=source, note=f"correction from SPEAKER_{label}")
+            db.record_correction(
+                source=source,
+                original_label=f"SPEAKER_{label}",
+                new_label=person,
+                note=str(audio),
+            )
+            sample_count = sum(1 for v in db.list_all() if v.name == person)
+            click.echo(f"  [OK] SPEAKER_{label} → {person} (sample_id={vp.sample_id}, 累計 {sample_count})")
+        click.echo(f"訂正完了: {len(parsed)} 件")
+    finally:
+        db.close()
+
+
+@main.command()
+@click.option("--limit", default=20, type=int, help="表示件数")
+def history(limit: int) -> None:
+    """訂正履歴を表示（誰がいつ何を修正したかのトレース）。"""
+    db = VoiceprintDB()
+    try:
+        rows = db.correction_history(limit=limit)
+        if not rows:
+            click.echo("訂正履歴なし。")
+            return
+        for r in rows:
+            orig = r.get("original_label") or "?"
+            click.echo(f"[{r['corrected_at']}] {orig} → {r['new_label']} (source={r['source']})")
     finally:
         db.close()
 

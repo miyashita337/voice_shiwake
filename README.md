@@ -73,23 +73,62 @@ cp .env.example .env
 
 ## 使い方
 
-### 1. 参加者の声紋を登録
+### 1. 参加者の声紋を登録（継続学習対応）
 
-各メンバーの **30秒程度** の音声サンプル（自己紹介など）を用意してから:
+各メンバーの **30秒程度** の音声サンプルを用意して `enroll`:
 
 ```bash
 voice-shiwake enroll --name "田中太郎" --audio samples/tanaka.wav
 voice-shiwake enroll --name "佐藤花子" --audio samples/sato.wav
-voice-shiwake enroll --name "鈴木一郎" --audio samples/suzuki.wav
 ```
 
-登録済みリスト:
+**同名で複数回 enroll すると追加サンプルとして蓄積されます**（既定動作）。
 
 ```bash
+# 同じ田中さんの別会議音声を追加（精度向上）
+voice-shiwake enroll --name "田中太郎" --audio samples/tanaka_meeting2.wav --source "weekly-2"
 voice-shiwake list
+# - 田中太郎: 2 samples [weekly-1, weekly-2]
 ```
 
-### 2. 会議動画を処理
+サンプルを丸ごと差し替えたい場合は `--replace`:
+
+```bash
+voice-shiwake enroll --name "田中太郎" --audio samples/new.wav --replace
+```
+
+### 2. 会議処理後に正解を教える（フィードバックループ）
+
+`process` 実行で `SPEAKER_A/B/C` のラベルが残った場合、各話者の代表音声を
+ローカルに保存して `correct` で正解人物名を紐付けます:
+
+```bash
+# 会議の各話者の代表音声を抽出（process が自動で work/samples/ に保存）
+ls work/samples/
+# SPEAKER_A.wav  SPEAKER_B.wav  SPEAKER_C.wav
+
+# Slack で議事録を見て「SPEAKER_A は渡辺、B は小川、C は林」と判明
+voice-shiwake correct --samples-dir work/samples/ \
+  --map A=山田太郎 \
+  --map B=小川 \
+  --map C=林
+
+# 履歴で監査
+voice-shiwake history
+# [2026-06-04 17:30] SPEAKER_A → 山田太郎 (source=samples)
+# [2026-06-04 17:30] SPEAKER_B → 小川 (source=samples)
+```
+
+**この訂正がそのまま追加サンプルとして DB に保存され、次回会議から識別精度が向上します。**
+
+### 3. 識別ロジック
+
+- 1名あたり N サンプル登録 → クエリ embedding と **全サンプル中の最大コサイン類似度** で判定
+- 外れ値（古い・ノイジーな1サンプル）に強い
+- サンプル数 ≥ 3 で精度大幅向上、≥ 5 で安定
+- `centroid` 類似度も並行計算しており、`match_detail()` で取得可能（分析用）
+
+### 4. 会議動画を処理
 
 ```bash
 voice-shiwake process --video meeting_2026_06_04.mp4 \
@@ -97,7 +136,7 @@ voice-shiwake process --video meeting_2026_06_04.mp4 \
   --post-slack
 ```
 
-### 3. （任意）videodb でアーカイブ＋検索
+### 5. （任意）videodb でアーカイブ＋検索
 
 ```bash
 # 動画を videodb にインデックス化
@@ -107,7 +146,7 @@ voice-shiwake index --video meeting_2026_06_04.mp4
 voice-shiwake search "予算の話"
 ```
 
-### 4. 環境診断
+### 6. 環境診断
 
 ```bash
 voice-shiwake check-deps
