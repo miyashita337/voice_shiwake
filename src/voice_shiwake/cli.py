@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 from .audio import extract_audio
 from .minutes import summarize_to_minutes
-from .slack import post_to_slack
+from .slack import SlackError, post_to_slack_auto
 from .transcribe import format_as_dialogue, transcribe
 from .roster import RosterDB
 from .videodb_adapter import VideodbError, semantic_search, upload_and_index
@@ -326,11 +326,18 @@ def process(
         # Slack
         if post_slack:
             click.echo("[5/5] Slack に投稿")
-            channel = os.environ.get("SLACK_CHANNEL_LABEL", "")
-            header = f":memo: *{title}*" + (f"  ({channel})" if channel else "")
-            result = post_to_slack(markdown, header=header)
+            channel_label = os.environ.get("SLACK_CHANNEL_LABEL", "")
+            parent_text = f":memo: *{title}*" + (f"  ({channel_label})" if channel_label else "")
+            try:
+                result = post_to_slack_auto(markdown, parent_text=parent_text, header=parent_text)
+            except SlackError as e:
+                click.echo(f"  投稿失敗: {e}", err=True)
+                sys.exit(2)
             if result.ok:
-                click.echo(f"  投稿成功: {result.message_count} メッセージ")
+                mode = "スレッド化" if result.thread_ts else "フラット (Webhook)"
+                click.echo(f"  投稿成功 ({mode}): {result.message_count} メッセージ")
+                if result.thread_ts:
+                    click.echo(f"  thread_ts: {result.thread_ts} channel: {result.channel}")
             else:
                 click.echo(f"  投稿失敗: {result.error}", err=True)
                 sys.exit(2)
@@ -569,7 +576,13 @@ def check_deps() -> None:
     checks.append(("ffmpeg", _shutil.which("ffmpeg") is not None, _shutil.which("ffmpeg") or "PATH に無し"))
     checks.append(("ASSEMBLYAI_API_KEY", bool(os.environ.get("ASSEMBLYAI_API_KEY")), "set" if os.environ.get("ASSEMBLYAI_API_KEY") else "未設定"))
     checks.append(("ANTHROPIC_API_KEY", bool(os.environ.get("ANTHROPIC_API_KEY")), "set" if os.environ.get("ANTHROPIC_API_KEY") else "未設定"))
-    checks.append(("SLACK_WEBHOOK_URL", bool(os.environ.get("SLACK_WEBHOOK_URL")), "set" if os.environ.get("SLACK_WEBHOOK_URL") else "未設定"))
+    checks.append(("SLACK_WEBHOOK_URL", bool(os.environ.get("SLACK_WEBHOOK_URL")), "set (フラット投稿可)" if os.environ.get("SLACK_WEBHOOK_URL") else "未設定"))
+    has_bot = bool(os.environ.get("SLACK_BOT_TOKEN")) and bool(os.environ.get("SLACK_CHANNEL_ID"))
+    checks.append((
+        "SLACK_BOT_TOKEN + SLACK_CHANNEL_ID",
+        has_bot,
+        "set (スレッド化投稿可、推奨)" if has_bot else "未設定（スレッド化したい場合は両方必要）",
+    ))
     checks.append(("VIDEODB_API_KEY", bool(os.environ.get("VIDEODB_API_KEY")), "set" if os.environ.get("VIDEODB_API_KEY") else "未設定（index/search 不可）"))
 
     for name, available, detail in checks:

@@ -8,7 +8,7 @@
 2. AssemblyAI で日本語文字起こし + 話者分離（diarization）
 3. 事前登録した参加者の声紋と照合 → `SPEAKER_A → 田中` のように個人名ラベル化
 4. Claude API で議事録形式に整形（要約・決定事項・ActionItem）
-5. Slack に Incoming Webhook で投稿
+5. Slack に投稿（Bot Token 経由ならスレッド化、Webhook ならフラット）
 
 ## 構成ツール役割マップ
 
@@ -257,6 +257,36 @@ voice-shiwake index --video meeting_2026_06_04.mp4
 # 過去議事録を意味検索
 voice-shiwake search "予算の話"
 ```
+
+### Slack 投稿の2方式
+
+| 方式 | スレッド化 | 設定 | 推奨用途 |
+|---|---|---|---|
+| **Incoming Webhook** | ❌ フラット投稿のみ | `SLACK_WEBHOOK_URL` | 簡易セットアップ |
+| **Bot Token (chat.postMessage)** | ✅ 親メッセージ + スレッド返信 | `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` | 「議事録さん」と同じ方式、推奨 |
+
+両方設定されている場合は **Bot Token 優先**で動作します。
+
+#### Bot Token セットアップ手順
+
+1. https://api.slack.com/apps → Create New App → From scratch
+2. App名「voice_shiwake」、Workspace「adacotech」
+3. **OAuth & Permissions** → **Bot Token Scopes** に以下を追加:
+   - `chat:write`（メッセージ投稿）
+   - `chat:write.public`（招待なし channel にも投稿する場合）
+4. **Install to Workspace** → **Bot User OAuth Token** (`xoxb-...`) をコピー
+5. 投稿先 channel で `/invite @voice_shiwake` を実行（chat:write.public 無しの場合）
+6. channel ID（`C0XXX`、channel 詳細から取得）と Token を `.env` に設定:
+   ```
+   SLACK_BOT_TOKEN=xoxb-...
+   SLACK_CHANNEL_ID=C0ADDPUUAAE
+   ```
+
+これで `voice-shiwake process --post-slack` で:
+- 親メッセージ: `:memo: *週次定例 議事録 (2026-06-01)*`
+- スレッド返信: 議事録本文を分割した複数メッセージ
+
+の形式で投稿されます（議事録さんと同じ）。
 
 ### 6. 環境診断
 
