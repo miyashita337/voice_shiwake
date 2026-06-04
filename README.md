@@ -163,6 +163,58 @@ SPEAKER_X.wav に**複数人の声が混ざる**ケースは実際に起こり�
 2. 別の会議で再度 `process` してきれいな SPEAKER_X.wav を取り直し
 3. どうしてもダメなら強制登録: `--no-quality-check`
 
+### 大量動画から一気に声紋を蓄積する（batch ワークフロー）
+
+参加者ロスター登録 → 動画一括処理 → 各動画の正解を順番に教える流れ:
+
+```bash
+# 1. 参加者を全員ロスター登録（typo チェックに使われる）
+voice-shiwake roster add 山田 鈴木 田中 佐藤 高橋 渡辺 中村 小林 加藤 吉田 山口 松井
+
+voice-shiwake roster list
+# - 山田
+# - 鈴木
+# - 田中
+# ...
+# 計 12 名
+
+# 2. 全動画を1つのディレクトリにまとめて batch-process
+voice-shiwake batch-process \
+  --videos-dir /path/to/all_meetings/ \
+  --output-base work/batch/ \
+  --skip-existing
+# → 動画ごとに work/batch/<動画名>/samples/SPEAKER_*.wav と minutes.md を生成
+
+# 3. 動画ごとに会議タイプ別タグを付けて correct
+# オフライン会議
+voice-shiwake correct --samples-dir work/batch/meeting1/samples/ \
+  --source "offline-2026-06-01" \
+  --map A=渡辺 --map B=山田 --map C=鈴木
+
+# オンライン会議
+voice-shiwake correct --samples-dir work/batch/meeting2/samples/ \
+  --source "online-2026-06-08" \
+  --map A=渡辺 --map B=田中 --map C=高橋
+
+# ハイブリッド会議
+voice-shiwake correct --samples-dir work/batch/meeting3/samples/ \
+  --source "hybrid-2026-06-15" \
+  --map A=渡辺 --map B=山田 --map C=中村
+
+# 4. 蓄積状況の確認
+voice-shiwake list
+# - 渡辺: 5 samples [offline-2026-06-01, online-..., hybrid-...]
+# - 山田: 3 samples [offline-2026-06-01, hybrid-...]
+# ...
+```
+
+**会議タイプ別 source タグ**を `--source` で渡すことで、同一人物の embedding が
+音響環境ごとに識別タグ付きで蓄積されます。`max similarity` 採用なので、
+どの環境のサンプルでも「最も近い1個」が判定材料になります。
+
+ハイブリッド会議の罠 (会議室マイク経由の声 vs 個人マイク) は、両方の環境の
+サンプルを同じ名前で蓄積することで自然に解消されます。
+
 ### サンプルを増やすには（質問②への回答）
 
 | 方法 | 工数 | 効果 |

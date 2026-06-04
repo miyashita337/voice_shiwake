@@ -15,6 +15,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import click
 from dotenv import load_dotenv
@@ -23,7 +24,9 @@ from .audio import extract_audio
 from .minutes import summarize_to_minutes
 from .slack import post_to_slack
 from .transcribe import format_as_dialogue, transcribe
+from .roster import RosterDB
 from .videodb_adapter import VideodbError, semantic_search, upload_and_index
+from .videodb_pipeline import VideodbPipelineError, process_video
 from .voiceprint import (
     HomogeneityResult,
     VoiceprintDB,
@@ -173,6 +176,21 @@ def correct(
             sys.exit(1)
         parsed.append((label, person))
 
+    # ロスターチェック（未登録名前を警告）
+    try:
+        roster_db = RosterDB()
+        roster_names = {m.name for m in roster_db.list_all()}
+        roster_db.close()
+        if roster_names:
+            unknown = [p for _, p in parsed if p not in roster_names]
+            if unknown:
+                click.echo(
+                    f"⚠ ロスター未登録の名前: {', '.join(unknown)}（typo 注意）",
+                    err=True,
+                )
+    except Exception:  # noqa: BLE001
+        pass  # ロスター無くても correct は続行
+
     db = VoiceprintDB()
     try:
         for label, person in parsed:
@@ -318,6 +336,193 @@ def process(
                 sys.exit(2)
         else:
             click.echo("[5/5] Slack 投稿スキップ（--post-slack で投稿）")
+
+
+@main.group()
+def roster() -> None:
+    """参加者ロスター（名簿）の管理。
+
+    batch-process 後の correct で「誰の声か」を判定する際の正規名リスト。
+    """
+
+
+@roster.command(name="add")
+@click.argument("names", nargs=-1, required=True)
+@click.option("--note", default="", help="メモ（任意）")
+def roster_add(names: tuple[str, ...], note: str) -> None:
+    """参加者を追加（複数可: roster add 山田 鈴木 田中）。"""
+    db = RosterDB()
+    try:
+        for name in names:
+            db.add(name, note=note)
+            click.echo(f"  + {name}")
+    finally:
+        db.close()
+
+
+@roster.command(name="list")
+def roster_list() -> None:
+    """登録参加者を一覧。"""
+    db = RosterDB()
+    try:
+        members = db.list_all()
+        if not members:
+            click.echo("ロスター未登録。`voice-shiwake roster add 名前 ...` で登録してください。")
+            return
+        for m in members:
+            note = f" - {m.note}" if m.note else ""
+            click.echo(f"- {m.name}{note}")
+        click.echo(f"\n計 {len(members)} 名")
+    finally:
+        db.close()
+
+
+@roster.command(name="remove")
+@click.argument("name")
+def roster_remove(name: str) -> None:
+    """参加者を削除。"""
+    db = RosterDB()
+    try:
+        if db.remove(name):
+            click.echo(f"削除: {name}")
+        else:
+            click.echo(f"見つからず: {name}", err=True)
+            sys.exit(1)
+    finally:
+        db.close()
+
+
+@main.command(name="batch-process")
+@click.option(
+    "--videos-dir",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="動画ファイルが入ったディレクトリ",
+)
+@click.option(
+    "--pattern",
+    default="*.mp4,*.mov,*.m4a,*.mkv,*.webm",
+    help="対象ファイルの glob パターン（カンマ区切り）",
+)
+@click.option(
+    "--output-base",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path("work/batch"),
+    help="各動画の出力先のベースディレクトリ（既定: work/batch）",
+)
+@click.option("--skip-existing", is_flag=True, help="output に minutes.md があれば skip")
+def batch_process(
+    videos_dir: Path,
+    pattern: str,
+    output_base: Path,
+    skip_existing: bool,
+) -> None:
+    """ディレクトリ内の全動画を videodb 経由で処理し、各動画ごとに samples/ + minutes.md を出力する。
+
+    出力構造:
+        output_base/
+          <動画名>/
+            audio.wav
+            transcript_structured.json
+            minutes.md
+            samples/SPEAKER_A.wav, SPEAKER_B.wav, ...
+
+    処理後は `voice-shiwake correct --samples-dir <出力先>/samples/ --source <タグ> --map ...`
+    で正解人物名を紐付けて声紋DBに登録する。
+    """
+    patterns = [p.strip() for p in pattern.split(",") if p.strip()]
+    videos: list[Path] = []
+    for p in patterns:
+        videos.extend(sorted(videos_dir.glob(p)))
+    # 重複除外
+    seen: set[str] = set()
+    unique_videos: list[Path] = []
+    for v in videos:
+        if str(v) not in seen:
+            seen.add(str(v))
+            unique_videos.append(v)
+    videos = unique_videos
+
+    if not videos:
+        click.echo(f"対象動画なし（{videos_dir} の pattern={pattern}）", err=True)
+        sys.exit(1)
+
+    click.echo(f"対象動画 {len(videos)} 件: {videos_dir}")
+    output_base.mkdir(parents=True, exist_ok=True)
+
+    summary: list[dict[str, Any]] = []
+    failures: list[tuple[str, str]] = []
+
+    for i, video in enumerate(videos, 1):
+        out_dir = output_base / video.stem
+        click.echo("=" * 60)
+        click.echo(f"[{i}/{len(videos)}] {video.name} ({video.stat().st_size / 1024 / 1024:.1f}MB) → {out_dir}")
+        if skip_existing and (out_dir / "minutes.md").exists():
+            click.echo("  [SKIP] minutes.md 既存")
+            continue
+        try:
+            result = process_video(video, out_dir)
+            speakers_info = ", ".join(
+                f"SPEAKER_{s.label}={s.total_sec:.0f}s" for s in result.speakers
+            )
+            click.echo(
+                f"  ✓ 完了: 話者{len(result.speakers)}名, "
+                f"{result.duration_sec:.0f}s音声, {result.n_utterances}発話 [{speakers_info}]"
+            )
+            summary.append(
+                {
+                    "video": str(video),
+                    "output_dir": str(out_dir),
+                    "videodb_id": result.videodb_id,
+                    "duration_sec": result.duration_sec,
+                    "n_speakers": len(result.speakers),
+                    "n_utterances": result.n_utterances,
+                }
+            )
+        except VideodbPipelineError as e:
+            click.echo(f"  ✗ 失敗: {e}", err=True)
+            failures.append((str(video), str(e)))
+        except Exception as e:  # noqa: BLE001
+            click.echo(f"  ✗ 予期せぬエラー: {e}", err=True)
+            failures.append((str(video), str(e)))
+
+    # サマリー JSON
+    summary_path = output_base / "_batch_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "ran_at": datetime.now().isoformat(),
+                "videos_dir": str(videos_dir),
+                "n_total": len(videos),
+                "n_success": len(summary),
+                "n_failed": len(failures),
+                "successes": summary,
+                "failures": failures,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    click.echo("=" * 60)
+    click.echo(f"完了: {len(summary)}/{len(videos)} 成功 ({len(failures)} 失敗)")
+    click.echo(f"サマリー: {summary_path}")
+    if summary:
+        click.echo("\n次のステップ: 各動画の SPEAKER を correct で正解教示")
+        for s in summary[:3]:
+            out_dir = Path(s["output_dir"])
+            click.echo(
+                f"  voice-shiwake correct --samples-dir {out_dir}/samples \\"
+            )
+            click.echo(
+                f"      --source \"<offline|online|hybrid>-{out_dir.name}\" \\"
+            )
+            click.echo(
+                f"      --map A=<名前> --map B=<名前> ..."
+            )
+        if len(summary) > 3:
+            click.echo(f"  ... 他 {len(summary) - 3} 件 (詳細は _batch_summary.json)")
 
 
 @main.command()
