@@ -23,6 +23,12 @@ from .audio import extract_audio
 from .minutes import summarize_to_minutes
 from .slack import post_to_slack
 from .transcribe import format_as_dialogue, transcribe
+from .vibevoice_adapter import (
+    VibeVoiceError,
+    check_availability,
+    synthesize_minutes,
+)
+from .videodb_adapter import VideodbError, semantic_search, upload_and_index
 from .voiceprint import VoiceprintDB, identify_speakers
 
 load_dotenv()
@@ -161,6 +167,79 @@ def process(
                 sys.exit(2)
         else:
             click.echo("[5/5] Slack 投稿スキップ（--post-slack で投稿）")
+
+
+@main.command()
+@click.option("--video", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="インデックス対象動画")
+@click.option("--collection", default="meetings", help="videodb の collection 名")
+def index(video: Path, collection: str) -> None:
+    """videodb に動画をアップロードして発話インデックスを作成。"""
+    try:
+        result = upload_and_index(video, collection_name=collection)
+    except VideodbError as e:
+        click.echo(f"videodb エラー: {e}", err=True)
+        sys.exit(2)
+    click.echo(f"video_id: {result.video_id}")
+    click.echo(f"collection_id: {result.collection_id}")
+    click.echo(f"indexed: {result.indexed} (transcript {result.transcript_chars} chars)")
+
+
+@main.command()
+@click.argument("query")
+@click.option("--collection", default="meetings", help="検索対象 collection")
+@click.option("--limit", default=5, type=int, help="返す件数")
+def search(query: str, collection: str, limit: int) -> None:
+    """過去のインデックス済み議事録を意味検索する。"""
+    try:
+        hits = semantic_search(query, collection_name=collection, limit=limit)
+    except VideodbError as e:
+        click.echo(f"videodb エラー: {e}", err=True)
+        sys.exit(2)
+    if not hits:
+        click.echo("ヒットなし")
+        return
+    for i, hit in enumerate(hits, 1):
+        click.echo(f"[{i}] video={hit.video_id} score={hit.score:.3f} ({hit.start_sec:.1f}s〜{hit.end_sec:.1f}s)")
+        click.echo(f"    {hit.text}")
+
+
+@main.command()
+@click.option("--minutes-md", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="議事録 Markdown")
+@click.option("--output", required=True, type=click.Path(dir_okay=False, path_type=Path), help="出力 WAV")
+def tts(minutes_md: Path, output: Path) -> None:
+    """議事録を VibeVoice で音声化する。"""
+    ok, reason = check_availability()
+    if not ok:
+        click.echo(f"VibeVoice 利用不可: {reason}", err=True)
+        sys.exit(2)
+    markdown = minutes_md.read_text(encoding="utf-8")
+    try:
+        result = synthesize_minutes(markdown, output)
+    except VibeVoiceError as e:
+        click.echo(f"VibeVoice エラー: {e}", err=True)
+        sys.exit(2)
+    click.echo(f"音声生成完了: {result.output_path}")
+    click.echo(f"  duration={result.duration_sec:.1f}s, sample_rate={result.sample_rate}Hz, backend={result.backend}")
+
+
+@main.command(name="check-deps")
+def check_deps() -> None:
+    """外部依存（ffmpeg / AssemblyAI / Claude / Slack / videodb / VibeVoice）の利用可否を診断。"""
+    import shutil as _shutil
+
+    checks: list[tuple[str, bool, str]] = []
+
+    checks.append(("ffmpeg", _shutil.which("ffmpeg") is not None, _shutil.which("ffmpeg") or "PATH に無し"))
+    checks.append(("ASSEMBLYAI_API_KEY", bool(os.environ.get("ASSEMBLYAI_API_KEY")), "set" if os.environ.get("ASSEMBLYAI_API_KEY") else "未設定"))
+    checks.append(("ANTHROPIC_API_KEY", bool(os.environ.get("ANTHROPIC_API_KEY")), "set" if os.environ.get("ANTHROPIC_API_KEY") else "未設定"))
+    checks.append(("SLACK_WEBHOOK_URL", bool(os.environ.get("SLACK_WEBHOOK_URL")), "set" if os.environ.get("SLACK_WEBHOOK_URL") else "未設定"))
+    checks.append(("VIDEODB_API_KEY", bool(os.environ.get("VIDEODB_API_KEY")), "set" if os.environ.get("VIDEODB_API_KEY") else "未設定（index/search 不可）"))
+    ok, reason = check_availability()
+    checks.append(("VibeVoice", ok, reason))
+
+    for name, available, detail in checks:
+        mark = "OK" if available else "NG"
+        click.echo(f"[{mark}] {name}: {detail}")
 
 
 if __name__ == "__main__":
