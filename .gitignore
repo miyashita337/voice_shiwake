@@ -21,6 +21,9 @@ voiceprints/
 minutes/
 output/
 
+# ワンショット作業ディレクトリ（個人情報含む音声・議事録・声紋サンプル）
+work/
+
 # python
 __pycache__/
 *.py[cod]
