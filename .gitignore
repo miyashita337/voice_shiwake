@@ -4,6 +4,9 @@
 *.sqlite3
 *.db
 
+# git-filter-repo の置換ルール（実名対応表を含むため絶対にコミット禁止）
+.filter-repo-replacements.txt
+
 # voiceprint samples (個人情報)
 samples/
 voiceprints/
