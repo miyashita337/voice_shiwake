@@ -1,0 +1,45 @@
+# env / secrets
+.env
+.env.local
+*.sqlite3
+*.db
+
+# voiceprint samples (個人情報)
+samples/
+voiceprints/
+
+# audio/video temp
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.flac
+*.ogg
+!tests/fixtures/*.wav
+
+# generated minutes
+minutes/
+output/
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# pytest / ruff / mypy
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
