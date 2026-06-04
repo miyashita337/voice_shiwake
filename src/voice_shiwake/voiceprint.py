@@ -104,6 +104,101 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
+@dataclass
+class HomogeneityResult:
+    """サンプル wav の内部一貫性判定。"""
+
+    mean_similarity: float
+    min_similarity: float
+    n_chunks: int
+    homogeneous: bool  # 既定閾値 (0.85) を超えていれば True
+    suspicion: str  # "ok" / "borderline" / "mixed"
+
+    @property
+    def warning_message(self) -> str | None:
+        if self.suspicion == "ok":
+            return None
+        if self.suspicion == "borderline":
+            return (
+                f"⚠ サンプル一貫性スコア {self.mean_similarity:.2f} (推奨 ≥ 0.85)。"
+                f"複数話者混在の可能性あり、念のため中身を確認してください。"
+            )
+        return (
+            f"❌ サンプル一貫性スコア {self.mean_similarity:.2f} (危険域 < 0.70)。"
+            f"複数人の声が混在している可能性が極めて高い。SPEAKER_X.wav の中身を"
+            f"確認し、被り発話・他人の声・BGMを除去するか、別会議のサンプルで再取得してください。"
+        )
+
+
+HOMOGENEITY_OK_THRESHOLD = 0.85
+HOMOGENEITY_DANGER_THRESHOLD = 0.70
+
+
+def _classify_homogeneity(mean_sim: float) -> str:
+    if mean_sim >= HOMOGENEITY_OK_THRESHOLD:
+        return "ok"
+    if mean_sim >= HOMOGENEITY_DANGER_THRESHOLD:
+        return "borderline"
+    return "mixed"
+
+
+def check_sample_homogeneity(
+    audio_path: Path,
+    *,
+    partial_rate: float = 1.0,
+) -> HomogeneityResult:
+    """音声サンプルが「単一話者の声」になっているか検査する。
+
+    アルゴリズム:
+      1. Resemblyzer の `embed_utterance(..., return_partials=True)` で
+         1.6秒ウィンドウごとの partial embedding を取得
+      2. 全ペアのコサイン類似度を計算
+      3. 平均類似度を「内部一貫性スコア」として返す
+
+    Args:
+        audio_path: 検査対象 WAV
+        partial_rate: partial embedding のサンプリングレート (default 1.0/s)
+
+    Returns:
+        HomogeneityResult（mean/min/分類）
+    """
+    encoder = _get_encoder()
+    wav = _load_wav_for_resemblyzer(audio_path)
+    # return_partials=True で (embed, partial_embeds, wav_splits) を取得
+    _, partial_embeds, _ = encoder.embed_utterance(
+        wav, return_partials=True, rate=partial_rate
+    )
+    return _evaluate_partials(np.asarray(partial_embeds))
+
+
+def _evaluate_partials(partial_embeds: np.ndarray) -> HomogeneityResult:
+    """partial embeddings 行列から一貫性スコアを計算する（テスト容易化のため分離）。"""
+    n = int(partial_embeds.shape[0]) if partial_embeds.ndim == 2 else 0
+    if n < 2:
+        # チャンク 1 個以下では判定不能 → ok 扱い（短すぎサンプルは別途警告）
+        return HomogeneityResult(
+            mean_similarity=1.0,
+            min_similarity=1.0,
+            n_chunks=n,
+            homogeneous=True,
+            suspicion="ok",
+        )
+    sims: list[float] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            sims.append(cosine_similarity(partial_embeds[i], partial_embeds[j]))
+    mean_sim = float(np.mean(sims))
+    min_sim = float(np.min(sims))
+    suspicion = _classify_homogeneity(mean_sim)
+    return HomogeneityResult(
+        mean_similarity=mean_sim,
+        min_similarity=min_sim,
+        n_chunks=n,
+        homogeneous=(suspicion == "ok"),
+        suspicion=suspicion,
+    )
+
+
 class VoiceprintDB:
     """SQLite ベースの multi-sample 声紋データベース。"""
 

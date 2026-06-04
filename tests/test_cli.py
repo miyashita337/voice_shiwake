@@ -29,7 +29,8 @@ class TestCLIEnroll:
         sample.touch()
 
         runner = CliRunner()
-        result = runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample)])
+        # 品質チェックはモック wav では実行できないので skip
+        result = runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample), "--no-quality-check"])
         assert result.exit_code == 0, result.output
         assert "登録完了" in result.output
         assert "田中" in result.output
@@ -43,9 +44,8 @@ class TestCLIEnroll:
         sample = tmp_path / "sample.wav"
         sample.touch()
         runner = CliRunner()
-        # 2回 enroll
-        runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample)])
-        result = runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample)])
+        runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample), "--no-quality-check"])
+        result = runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample), "--no-quality-check"])
         assert "累計 2" in result.output
 
     def test_enroll_replace_resets_samples(self, tmp_path, monkeypatch):
@@ -56,11 +56,61 @@ class TestCLIEnroll:
         sample = tmp_path / "sample.wav"
         sample.touch()
         runner = CliRunner()
-        runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample)])
-        runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample)])
-        result = runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample), "--replace"])
+        runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample), "--no-quality-check"])
+        runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample), "--no-quality-check"])
+        result = runner.invoke(
+            main,
+            ["enroll", "--name", "田中", "--audio", str(sample), "--replace", "--no-quality-check"],
+        )
         assert "累計 1" in result.output
         assert "上書き" in result.output
+
+    def test_enroll_strict_aborts_on_mixed_sample(self, tmp_path, monkeypatch):
+        """品質チェックで mixed 判定 + --strict → exit 3 で登録中止。"""
+        monkeypatch.setenv("VOICEPRINT_DB_PATH", str(tmp_path / "db.sqlite3"))
+        from voice_shiwake import cli as cli_mod
+        from voice_shiwake.voiceprint import HomogeneityResult
+
+        mixed = HomogeneityResult(
+            mean_similarity=0.42,
+            min_similarity=0.30,
+            n_chunks=10,
+            homogeneous=False,
+            suspicion="mixed",
+        )
+        monkeypatch.setattr(cli_mod, "check_sample_homogeneity", lambda p: mixed)
+
+        sample = tmp_path / "mixed.wav"
+        sample.touch()
+        runner = CliRunner()
+        result = runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample), "--strict"])
+        assert result.exit_code == 3
+        assert "混在" in result.output
+
+    def test_enroll_warns_but_continues_without_strict(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("VOICEPRINT_DB_PATH", str(tmp_path / "db.sqlite3"))
+        from voice_shiwake import cli as cli_mod
+        from voice_shiwake import voiceprint as vp_mod
+        from voice_shiwake.voiceprint import HomogeneityResult
+
+        borderline = HomogeneityResult(
+            mean_similarity=0.78,
+            min_similarity=0.60,
+            n_chunks=8,
+            homogeneous=False,
+            suspicion="borderline",
+        )
+        monkeypatch.setattr(cli_mod, "check_sample_homogeneity", lambda p: borderline)
+        monkeypatch.setattr(vp_mod, "compute_embedding", lambda p: np.array([0.5, 0.5]))
+
+        sample = tmp_path / "border.wav"
+        sample.touch()
+        runner = CliRunner()
+        result = runner.invoke(main, ["enroll", "--name", "田中", "--audio", str(sample)])
+        # 警告は出るが exit 0
+        assert result.exit_code == 0
+        assert "登録完了" in result.output
+        assert "混在の可能性" in result.output
 
 
 class TestCLIDelete:
@@ -76,7 +126,6 @@ class TestCLICorrect:
         monkeypatch.setenv("VOICEPRINT_DB_PATH", str(tmp_path / "db.sqlite3"))
         from voice_shiwake import voiceprint as vp_mod
 
-        # 異なる音声に対して異なる embedding を返すように
         embs = {
             "A": np.array([1.0, 0.0]),
             "B": np.array([0.0, 1.0]),
@@ -89,7 +138,6 @@ class TestCLICorrect:
             return np.array([0.0, 0.0])
         monkeypatch.setattr(vp_mod, "compute_embedding", fake_compute)
 
-        # ディレクトリ＋ 3 個の wav を準備
         samples_dir = tmp_path / "samples"
         samples_dir.mkdir()
         for key in ["A", "B", "C"]:
@@ -104,6 +152,7 @@ class TestCLICorrect:
                 "--map", "A=渡辺",
                 "--map", "B=小川",
                 "--map", "C=林",
+                "--no-quality-check",
             ],
         )
         assert result.exit_code == 0, result.output
@@ -129,7 +178,6 @@ class TestCLICorrect:
         samples_dir = tmp_path / "samples"
         samples_dir.mkdir()
         (samples_dir / "SPEAKER_A.wav").touch()
-        # SPEAKER_B.wav は存在しない
 
         runner = CliRunner()
         result = runner.invoke(
@@ -139,6 +187,7 @@ class TestCLICorrect:
                 "--samples-dir", str(samples_dir),
                 "--map", "A=渡辺",
                 "--map", "B=小川",
+                "--no-quality-check",
             ],
         )
         # A は登録、B は SKIP

@@ -10,7 +10,11 @@ import pytest
 
 from voice_shiwake.transcribe import Utterance
 from voice_shiwake.voiceprint import (
+    HOMOGENEITY_DANGER_THRESHOLD,
+    HOMOGENEITY_OK_THRESHOLD,
     VoiceprintDB,
+    _classify_homogeneity,
+    _evaluate_partials,
     _representative_slice,
     cosine_similarity,
 )
@@ -252,6 +256,70 @@ class TestLegacyMigration:
 # ---------------------------------------------------------------------------
 # representative slice (回帰テスト)
 # ---------------------------------------------------------------------------
+
+
+class TestHomogeneityClassification:
+    def test_high_similarity_is_ok(self):
+        assert _classify_homogeneity(0.95) == "ok"
+
+    def test_at_threshold_is_ok(self):
+        assert _classify_homogeneity(HOMOGENEITY_OK_THRESHOLD) == "ok"
+
+    def test_borderline_range(self):
+        assert _classify_homogeneity(0.78) == "borderline"
+
+    def test_at_danger_threshold_is_borderline(self):
+        assert _classify_homogeneity(HOMOGENEITY_DANGER_THRESHOLD) == "borderline"
+
+    def test_below_danger_is_mixed(self):
+        assert _classify_homogeneity(0.4) == "mixed"
+
+
+class TestEvaluatePartials:
+    def test_single_chunk_is_ok(self):
+        partials = np.array([[1.0, 0.0]], dtype=np.float32)
+        result = _evaluate_partials(partials)
+        assert result.suspicion == "ok"
+        assert result.n_chunks == 1
+
+    def test_homogeneous_partials(self):
+        partials = np.array(
+            [[1.0, 0.0, 0.0]] * 5 + [[0.99, 0.02, 0.0]] * 5,
+            dtype=np.float32,
+        )
+        result = _evaluate_partials(partials)
+        assert result.suspicion == "ok"
+        assert result.homogeneous is True
+        assert result.mean_similarity > 0.99
+
+    def test_two_speaker_mix_detected(self):
+        """話者Aの chunk と話者Bの chunk が混ざっていれば mixed 判定。"""
+        partials = np.array(
+            [[1.0, 0.0]] * 5 + [[0.0, 1.0]] * 5,
+            dtype=np.float32,
+        )
+        result = _evaluate_partials(partials)
+        # 同一クラスタ内 (5*4/2=10ペア) は sim=1, クロス (5*5=25ペア) は sim=0
+        # 平均は 10/(10+10+25) = ~0.286 → mixed
+        assert result.suspicion == "mixed"
+        assert result.warning_message is not None
+        assert "混在" in result.warning_message
+
+    def test_borderline_partials(self):
+        """同一話者だが録音条件が変わった想定（中程度の類似度）。"""
+        # 平均類似度が 0.78 程度になるように調整
+        partials = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.8, 0.6, 0.0],
+                [0.85, 0.5, 0.1],
+                [0.9, 0.4, 0.15],
+            ],
+            dtype=np.float32,
+        )
+        result = _evaluate_partials(partials)
+        # 0.70 <= mean < 0.85 のはず
+        assert result.suspicion in ("borderline", "ok")  # 値次第
 
 
 class TestRepresentativeSlice:

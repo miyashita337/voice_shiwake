@@ -128,6 +128,66 @@ voice-shiwake history
 - サンプル数 ≥ 3 で精度大幅向上、≥ 5 で安定
 - `centroid` 類似度も並行計算しており、`match_detail()` で取得可能（分析用）
 
+### サンプル品質チェック（混在検出）
+
+SPEAKER_X.wav に**複数人の声が混ざる**ケースは実際に起こります:
+
+- diarization の誤分離（videodb が別人を同じラベルに）
+- 同時発話の被り（A が話している裏で B の相槌）
+- BGM・ハウリング・他人のマイク混信
+
+`enroll` / `correct` は自動的に**内部一貫性スコア**を計算して警告します:
+
+```
+[1/2] 品質チェック: SPEAKER_B.wav
+  [OK] サンプル一貫性スコア 0.912 (chunks=18, min=0.851)
+[2/2] 声紋DB に登録
+登録完了 (追加): 小川 sample_id=0 (累計 1 sample)
+```
+
+混在が疑われる場合:
+
+```
+  ⚠ サンプル一貫性スコア 0.62 (推奨 ≥ 0.85)。複数話者混在の可能性...
+```
+
+| スコア | 判定 | 既定動作 | `--strict` 動作 |
+|---|---|---|---|
+| ≥ 0.85 | 単一話者 | 続行 | 続行 |
+| 0.70〜0.85 | グレー | 警告→続行 | 警告→続行 |
+| < 0.70 | **混在の疑い** | 警告→続行 | **exit 3 で登録中止** |
+
+検出後の対処:
+
+1. SPEAKER_X.wav を Audacity 等で開き、他人の声を切り取って `enroll` し直す
+2. 別の会議で再度 `process` してきれいな SPEAKER_X.wav を取り直し
+3. どうしてもダメなら強制登録: `--no-quality-check`
+
+### サンプルを増やすには（質問②への回答）
+
+| 方法 | 工数 | 効果 |
+|---|---|---|
+| **A. 各人に30秒の自己紹介を録音してもらい enroll** | 1人5分 | 即時1サンプル、最確実 |
+| **B. 過去の会議動画 N 本を `process` → `correct`** | 動画N本のAPIコスト | 一発でNサンプル蓄積 |
+| **C. 毎週の定例で `process` → ズレてたら `correct`** | 0（自然蓄積） | 数週間で5サンプル到達 |
+
+**推奨フロー**:
+1. **初回**: A で 1サンプル登録（最初の精度ベースを作る）
+2. **以降**: C で会議のたびに `correct` 実行 → 自然に蓄積
+3. **B のショートカット**: 過去会議が手元にあれば一気に蓄積可能
+
+```bash
+# B案: 過去動画から一気に蓄積する例
+for video in past_meetings/*.mp4; do
+  voice-shiwake process --video "$video" --save-json work/$(basename "$video").json
+  # 各動画の話者を Slack 等で確認後
+  voice-shiwake correct --samples-dir work/$(basename "$video" .mp4)/samples \
+    --map A=山田太郎 --map B=小川 --map C=林
+done
+voice-shiwake list
+# - 山田太郎: 5 samples [video1, video2, video3, video4, video5]
+```
+
 ### 4. 会議動画を処理
 
 ```bash

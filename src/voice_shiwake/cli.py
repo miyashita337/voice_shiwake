@@ -24,7 +24,49 @@ from .minutes import summarize_to_minutes
 from .slack import post_to_slack
 from .transcribe import format_as_dialogue, transcribe
 from .videodb_adapter import VideodbError, semantic_search, upload_and_index
-from .voiceprint import VoiceprintDB, identify_speakers
+from .voiceprint import (
+    HomogeneityResult,
+    VoiceprintDB,
+    check_sample_homogeneity,
+    identify_speakers,
+)
+
+
+def _run_quality_check(
+    audio_path: Path,
+    *,
+    skip: bool,
+    strict: bool,
+) -> HomogeneityResult | None:
+    """品質チェックを実行し、結果に応じて警告 or 終了する。
+
+    Returns:
+        実行した場合は HomogeneityResult、skip した場合は None
+    """
+    if skip:
+        return None
+    try:
+        result = check_sample_homogeneity(audio_path)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"  [WARN] 品質チェック実行失敗（続行）: {e}", err=True)
+        return None
+
+    msg = result.warning_message
+    if msg:
+        click.echo(f"  {msg}", err=True)
+        if strict and result.suspicion == "mixed":
+            click.echo(
+                "  --strict 指定により登録を中止します。"
+                " --no-quality-check で強制登録可能。",
+                err=True,
+            )
+            sys.exit(3)
+    else:
+        click.echo(
+            f"  [OK] サンプル一貫性スコア {result.mean_similarity:.3f} "
+            f"(chunks={result.n_chunks}, min={result.min_similarity:.3f})"
+        )
+    return result
 
 load_dotenv()
 
@@ -41,12 +83,24 @@ def main() -> None:
 @click.option("--source", default="", help="サンプル出所（例: 2026-06-01 weekly）")
 @click.option("--note", default="", help="メモ（任意）")
 @click.option("--replace", is_flag=True, help="既存サンプルを全削除してから登録（既定: 追加モード）")
-def enroll(name: str, audio: Path, source: str, note: str, replace: bool) -> None:
+@click.option("--no-quality-check", is_flag=True, help="サンプル品質チェックをスキップ")
+@click.option("--strict", is_flag=True, help="品質チェックで「混在」判定なら exit 3")
+def enroll(
+    name: str,
+    audio: Path,
+    source: str,
+    note: str,
+    replace: bool,
+    no_quality_check: bool,
+    strict: bool,
+) -> None:
     """参加者の声紋を登録する（既定は追加モード、同名で複数サンプル蓄積可能）。"""
+    click.echo(f"[1/2] 品質チェック: {audio.name}")
+    _run_quality_check(audio, skip=no_quality_check, strict=strict)
+    click.echo("[2/2] 声紋DB に登録")
     db = VoiceprintDB()
     try:
         vp = db.enroll(name=name, audio_path=audio, source=source, note=note, replace=replace)
-        # 同名サンプル数を表示
         sample_count = sum(1 for v in db.list_all() if v.name == name)
         mode = "上書き" if replace else "追加"
         click.echo(f"登録完了 ({mode}): {vp.name} sample_id={vp.sample_id} (累計 {sample_count} sample)")
@@ -90,7 +144,15 @@ def delete(name: str) -> None:
 @click.option("--samples-dir", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path), help="SPEAKER_*.wav が入ったディレクトリ")
 @click.option("--map", "mappings", multiple=True, required=True, help="ラベル対応（複数指定可）。例: --map A=田中 --map B=佐藤")
 @click.option("--source", default="", help="サンプル出所（既定: ディレクトリ名）")
-def correct(samples_dir: Path, mappings: tuple[str, ...], source: str) -> None:
+@click.option("--no-quality-check", is_flag=True, help="サンプル品質チェックをスキップ")
+@click.option("--strict", is_flag=True, help="混在判定のサンプルは登録せずスキップ")
+def correct(
+    samples_dir: Path,
+    mappings: tuple[str, ...],
+    source: str,
+    no_quality_check: bool,
+    strict: bool,
+) -> None:
     """SPEAKER_X.wav に正解の人物名を紐付けて声紋DBに追加する（継続学習）。
 
     例:
@@ -123,6 +185,27 @@ def correct(samples_dir: Path, mappings: tuple[str, ...], source: str) -> None:
             if audio is None:
                 click.echo(f"  [SKIP] SPEAKER_{label}.wav が見つからず", err=True)
                 continue
+
+            # 品質チェック（strict 時は混在なら登録スキップ）
+            click.echo(f"SPEAKER_{label} → {person}: 品質チェック ({audio.name})")
+            if not no_quality_check:
+                try:
+                    quality = check_sample_homogeneity(audio)
+                except Exception as e:  # noqa: BLE001
+                    click.echo(f"  [WARN] 品質チェック失敗（続行）: {e}", err=True)
+                    quality = None
+                if quality is not None:
+                    if quality.warning_message:
+                        click.echo(f"  {quality.warning_message}", err=True)
+                        if strict and quality.suspicion == "mixed":
+                            click.echo(
+                                f"  [SKIP] strict mode: SPEAKER_{label} → {person} 登録をスキップ",
+                                err=True,
+                            )
+                            continue
+                    else:
+                        click.echo(f"  [OK] 一貫性 {quality.mean_similarity:.3f}")
+
             vp = db.enroll(name=person, audio_path=audio, source=source, note=f"correction from SPEAKER_{label}")
             db.record_correction(
                 source=source,
