@@ -590,5 +590,89 @@ def check_deps() -> None:
         click.echo(f"[{mark}] {name}: {detail}")
 
 
+@main.command()
+@click.option(
+    "--audio",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="16kHz mono WAV (process_video の出力 audio.wav)",
+)
+@click.option(
+    "--transcript-json",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="videodb の word-level JSON (transcript_structured.json)",
+)
+@click.option(
+    "--candidates",
+    required=True,
+    help="カンマ区切りの候補名（例: 宮下,酒井）。声紋DBに登録済みである必要あり",
+)
+@click.option("--vad-mode", type=int, default=2, help="webrtcvad mode 0(緩)〜3(厳格)、既定 2")
+@click.option("--min-pause-ms", type=int, default=300, help="この長さ以上の無音で segment 分割、既定 300ms")
+@click.option("--min-seg-ms", type=int, default=500, help="この長さ未満の segment は捨てる、既定 500ms")
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="dialogue 出力先 Markdown",
+)
+def rediarize(
+    audio: Path,
+    transcript_json: Path,
+    candidates: str,
+    vad_mode: int,
+    min_pause_ms: int,
+    min_seg_ms: int,
+    output: Path | None,
+) -> None:
+    """VADベースで話者再分離する（候補限定、後処理用）。
+
+    videodb の盲目 diarization が話者をまとめて取りこぼした場合に、既知の候補名を
+    指定して声紋DBから照合する。オフライン1マイクの音響条件では本質的な限界あり。
+    """
+    from .vad_rediarize import format_rediarized_dialogue, rediarize_with_vad
+
+    cand_list = [c.strip() for c in candidates.split(",") if c.strip()]
+    if len(cand_list) < 2:
+        click.echo("候補は2名以上指定してください", err=True)
+        sys.exit(2)
+
+    click.echo(f"候補: {cand_list}")
+    click.echo(f"VAD mode={vad_mode}, min_pause={min_pause_ms}ms, min_seg={min_seg_ms}ms")
+
+    try:
+        result = rediarize_with_vad(
+            audio,
+            transcript_json,
+            cand_list,
+            vad_mode=vad_mode,
+            min_pause_ms=min_pause_ms,
+            min_seg_ms=min_seg_ms,
+        )
+    except ValueError as e:
+        click.echo(f"エラー: {e}", err=True)
+        sys.exit(2)
+
+    raw_n = len(result["raw_segments"])
+    merged_n = len(result["segments"])
+    embedded = result["embedded_count"]
+    click.echo(f"VAD segment: {raw_n} (うち embed {embedded})、merge後ブロック: {merged_n}")
+    for label, st in result["stats"].items():
+        click.echo(f"  {label}: count={st['count']}, duration={st['duration_s']:.1f}s")
+    click.echo(f"平均マージン (winner-loser cos差): {result['avg_margin']:.3f}")
+    if result["avg_margin"] < 0.10:
+        click.echo("  WARN: マージン < 0.10 は信頼度低（音響条件が不利）")
+
+    dialogue = format_rediarized_dialogue(result["segments"])
+    if output is None:
+        output = audio.parent / "rediarized_dialogue.md"
+    output.write_text(
+        f"# 再分離 dialogue (候補: {', '.join(cand_list)})\n\n```\n{dialogue}\n```\n",
+        encoding="utf-8",
+    )
+    click.echo(f"保存: {output}")
+
+
 if __name__ == "__main__":
     main()
